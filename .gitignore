@@ -1,0 +1,13 @@
+# Runtime logs — contain other students' names/phone numbers from live
+# booking responses. Never commit these.
+logs/
+
+# Compiled binaries (build artifacts)
+/cruiser
+/cruiser.exe
+/cruiser-mac-arm64
+/cruiser-mac-intel
+*.exe
+
+# Any local secret cache that ever lands on disk
+*.dat
