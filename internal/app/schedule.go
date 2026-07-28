@@ -237,6 +237,8 @@ func formatSlot(t time.Time) string { return t.Format("1/2/2006 3:04pm") }
 
 // RFC 3986 escape, equivalent to .NET Uri.EscapeDataString for our data
 // (spaces -> %20, / -> %2F, : -> %3A; unreserved chars kept literal).
+// Iterating bytes (not runes) is intentional: a multibyte UTF-8 name is
+// percent-encoded one byte at a time, which is exactly correct RFC 3986 output.
 func escapeData(s string) string {
 	var b strings.Builder
 	for _, c := range []byte(s) {
@@ -315,18 +317,30 @@ func validationMessage(page string) string {
 
 type profileInfo struct{ FullName, Phone, Mobile string }
 
+// profileFieldRe matches one reservation input tag by field name; profileValueRe
+// pulls its value= attribute. Compiled once (not per call) like every other
+// regex in this file.
+var (
+	profileFieldRe = regexp.MustCompile(`(?is)<input[^>]*name="reservation\[(full_name|phone|mobile)\]"[^>]*>`)
+	profileValueRe = regexp.MustCompile(`value="([^"]*)"`)
+)
+
 func getProfileFields(page string) profileInfo {
-	get := func(field string) string {
-		tagRe := regexp.MustCompile(`(?is)<input[^>]*name="reservation\[` + field + `\]"[^>]*>`)
-		tag := tagRe.FindString(page)
-		if tag == "" {
-			return ""
-		}
-		v := regexp.MustCompile(`value="([^"]*)"`).FindStringSubmatch(tag)
+	var p profileInfo
+	for _, tag := range profileFieldRe.FindAllStringSubmatch(page, -1) {
+		v := profileValueRe.FindStringSubmatch(tag[0])
 		if v == nil {
-			return ""
+			continue
 		}
-		return html.UnescapeString(v[1])
+		val := html.UnescapeString(v[1])
+		switch tag[1] {
+		case "full_name":
+			p.FullName = val
+		case "phone":
+			p.Phone = val
+		case "mobile":
+			p.Mobile = val
+		}
 	}
-	return profileInfo{FullName: get("full_name"), Phone: get("phone"), Mobile: get("mobile")}
+	return p
 }

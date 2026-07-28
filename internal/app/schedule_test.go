@@ -94,6 +94,29 @@ func TestOpenRowsAndWindow(t *testing.T) {
 	}
 }
 
+func TestGetOpenRowsSkipsMalformed(t *testing.T) {
+	// A too-short row (3 fields) and a row with a non-numeric field are both
+	// skipped; only the valid 5-field row survives — and no panic on garbage.
+	page := fmt.Sprintf("ecache = {data: [[%d,%d,1],[%d,%d,1,480,720],[%d,%d,1,xx,720]]}",
+		e("2026-09-06"), e("2026-09-06 23:59"), // 3 fields -> skipped
+		e("2026-09-07"), e("2026-09-07 23:59"), // valid
+		e("2026-09-08"), e("2026-09-08 23:59")) // non-numeric openMin -> skipped
+	od := getOpenRows(page)
+	if len(od.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1 (short row + non-numeric row skipped)", len(od.Rows))
+	}
+	if !od.Rows[0].Date.Equal(day("2026-09-07")) || od.Rows[0].Open != 480 {
+		t.Errorf("surviving row = %+v", od.Rows[0])
+	}
+	if !od.Min.Equal(day("2026-09-07")) || !od.Max.Equal(day("2026-09-07")) {
+		t.Errorf("coverage = %v..%v, want single day 2026-09-07", od.Min, od.Max)
+	}
+	// A page with no ecache at all yields empty data, not a panic.
+	if got := getOpenRows("<html>no ecache here</html>"); len(got.Rows) != 0 || !got.Min.IsZero() {
+		t.Errorf("no-ecache page = %+v, want empty", got)
+	}
+}
+
 func TestGetBookings(t *testing.T) {
 	bk := getBookings(fixture(), day("2026-09-07"), "Cached Owner")
 	if len(bk) != 2 {
@@ -186,6 +209,11 @@ func TestEscapeData(t *testing.T) {
 	}
 	if got := escapeData("A-b_c.d~"); got != "A-b_c.d~" {
 		t.Errorf("unreserved chars must pass through: %s", got)
+	}
+	// Multibyte UTF-8 is encoded one byte at a time (é = 0xC3 0xA9), which is
+	// correct RFC 3986 output — the byte-wise loop in escapeData is intentional.
+	if got := escapeData("José"); got != "Jos%C3%A9" {
+		t.Errorf("multibyte UTF-8 = %s, want Jos%%C3%%A9", got)
 	}
 }
 

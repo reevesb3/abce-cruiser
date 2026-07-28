@@ -104,23 +104,22 @@ func isLoginPage(page, finalURL string) bool {
 
 // ----------------------------- cookie cache ---------------------------------
 
-func loadCookiesIntoJar(client *http.Client) bool {
-	lines, ok := keyringGetLines("cookies", 2)
-	if !ok || lines[1] == "" {
-		return false
-	}
+// cookiesToJar injects the cached keep/session cookie values into a jar. Split
+// from loadCookiesIntoJar so the jar mapping is testable without the keyring.
+func cookiesToJar(jar http.CookieJar, keep, sess string) {
 	var cs []*http.Cookie
-	if lines[0] != "" {
-		cs = append(cs, &http.Cookie{Name: "SS_31343_keep", Value: lines[0], Path: "/"})
+	if keep != "" {
+		cs = append(cs, &http.Cookie{Name: "SS_31343_keep", Value: keep, Path: "/"})
 	}
-	cs = append(cs, &http.Cookie{Name: "_SS_s", Value: lines[1], Path: "/"})
-	client.Jar.SetCookies(baseURL, cs)
-	return true
+	cs = append(cs, &http.Cookie{Name: "_SS_s", Value: sess, Path: "/"})
+	jar.SetCookies(baseURL, cs)
 }
 
-func saveCookiesFromJar(client *http.Client) {
-	var keep, sess string
-	for _, c := range client.Jar.Cookies(baseURL) {
+// cookiesFromJar extracts the session (_SS_s) and keep (SS_*_keep) cookie values
+// from a jar. Split from saveCookiesFromJar so the name-matching is testable
+// without touching the credential store.
+func cookiesFromJar(jar http.CookieJar) (keep, sess string) {
+	for _, c := range jar.Cookies(baseURL) {
 		switch {
 		case c.Name == "_SS_s":
 			sess = c.Value
@@ -128,6 +127,20 @@ func saveCookiesFromJar(client *http.Client) {
 			keep = c.Value
 		}
 	}
+	return keep, sess
+}
+
+func loadCookiesIntoJar(client *http.Client) bool {
+	lines, ok := keyringGetLines("cookies", 2)
+	if !ok || lines[1] == "" {
+		return false
+	}
+	cookiesToJar(client.Jar, lines[0], lines[1])
+	return true
+}
+
+func saveCookiesFromJar(client *http.Client) {
+	keep, sess := cookiesFromJar(client.Jar)
 	if sess == "" {
 		return
 	}

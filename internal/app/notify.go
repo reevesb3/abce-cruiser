@@ -9,10 +9,9 @@ import (
 	"github.com/gen2brain/beeep"
 )
 
-var (
-	logDir  = "logs"
-	logFile *os.File
-)
+const logDir = "logs"
+
+var logFile *os.File
 
 func initLog() {
 	_ = os.MkdirAll(logDir, 0o755)
@@ -22,7 +21,7 @@ func initLog() {
 	}
 }
 
-func logf(format string, a ...interface{}) {
+func logf(format string, a ...any) {
 	line := fmt.Sprintf("[%s] %s", time.Now().Format("2006-01-02 15:04:05.000"), fmt.Sprintf(format, a...))
 	fmt.Println(line)
 	if logFile != nil {
@@ -30,7 +29,7 @@ func logf(format string, a ...interface{}) {
 	}
 }
 
-func fatalf(format string, a ...interface{}) {
+func fatalf(format string, a ...any) {
 	logf("ERROR: "+format, a...)
 	os.Exit(1)
 }
