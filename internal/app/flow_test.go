@@ -526,6 +526,7 @@ func (h *attemptHarness) deps() attemptDeps {
 		saveHTML: func(a int, p string) string { return fmt.Sprintf("mem_%d", a) },
 		reauth:   func() bool { h.reauths++; return h.reauthOK },
 		sleep:    func(d time.Duration) { h.sleeps++; h.clock = h.clock.Add(d) },
+		jitter:   func(d time.Duration) time.Duration { return d }, // deterministic: no jitter in tests
 		now:      func() time.Time { return h.clock },
 		notify:   func(title, msg string) { h.notices = append(h.notices, title) },
 	}
@@ -633,5 +634,25 @@ func TestRunAttemptsRequestErrorRetriesSameSeat(t *testing.T) {
 	}
 	if !reflect.DeepEqual(h.posted, []string{"84893", "84893"}) {
 		t.Errorf("posted = %v", h.posted)
+	}
+}
+
+func TestJitterDelayStaysInBounds(t *testing.T) {
+	const base = 3 * time.Second
+	for i := 0; i < 1000; i++ {
+		d := jitterDelay(base)
+		if d < minRetry || d > base {
+			t.Fatalf("jitterDelay(%s) = %s, want within [%s, %s]", base, d, minRetry, base)
+		}
+	}
+}
+
+// A base at or below the floor is returned unchanged - no jitter room.
+func TestJitterDelayAtFloor(t *testing.T) {
+	if d := jitterDelay(minRetry); d != minRetry {
+		t.Errorf("jitterDelay(%s) = %s, want %s", minRetry, d, minRetry)
+	}
+	if d := jitterDelay(minRetry / 2); d != minRetry/2 {
+		t.Errorf("jitterDelay(%s) = %s, want %s", minRetry/2, d, minRetry/2)
 	}
 }
