@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -505,6 +506,21 @@ const (
 	outcomeGaveUp                            // hit the give-up time
 )
 
+// minRetry is the floor for a jittered poll delay - we never wait less than a
+// second between attempts.
+const minRetry = time.Second
+
+// jitterDelay randomizes a retry delay so this run doesn't poll the site in
+// lockstep with other automations. It returns a duration uniformly in
+// [minRetry, base]; if base is already at or below the floor, base is returned
+// unchanged.
+func jitterDelay(base time.Duration) time.Duration {
+	if base <= minRetry {
+		return base
+	}
+	return minRetry + rand.N(base-minRetry+1)
+}
+
 // attemptDeps is everything runAttempts needs from the outside world, so the
 // loop's decision logic is testable with fakes.
 type attemptDeps struct {
@@ -512,6 +528,7 @@ type attemptDeps struct {
 	saveHTML func(attempt int, page string) string // returns saved path (for log messages)
 	reauth   func() bool
 	sleep    func(time.Duration)
+	jitter   func(time.Duration) time.Duration // randomizes a retry delay; identity in tests
 	now      func() time.Time
 	notify   func(title, msg string)
 }
@@ -531,7 +548,7 @@ func runAttempts(prefs []seatOption, target, giveUp time.Time, retryEvery time.D
 		page, finalURL, err := d.post(slot)
 		if err != nil {
 			logf("Attempt %d [%s]: request error: %v", attempt, label, err)
-			d.sleep(retryEvery)
+			d.sleep(d.jitter(retryEvery))
 			continue
 		}
 		htmlFile := d.saveHTML(attempt, page)
@@ -539,7 +556,7 @@ func runAttempts(prefs []seatOption, target, giveUp time.Time, retryEvery time.D
 		if isLoginPage(page, finalURL) {
 			logf("Attempt %d [%s]: session expired - reauthenticating...", attempt, label)
 			if !d.reauth() {
-				d.sleep(retryEvery)
+				d.sleep(d.jitter(retryEvery))
 			}
 			continue
 		}
@@ -551,9 +568,10 @@ func runAttempts(prefs []seatOption, target, giveUp time.Time, retryEvery time.D
 				"SuperSaaS reservation submitted - check the response HTML / your email to confirm.")
 			return outcomeBooked, attempt
 		case "retry":
+			delay := d.jitter(retryEvery)
 			logf("Attempt %d [%s]: not open yet (matched %q) - retrying in %s",
-				attempt, label, retryRe.FindString(page), retryEvery)
-			d.sleep(retryEvery)
+				attempt, label, retryRe.FindString(page), delay)
+			d.sleep(delay)
 		case "taken":
 			logf("Attempt %d [%s]: slot taken - moving to next choice.", attempt, label)
 			idx++
@@ -590,6 +608,7 @@ func realAttemptDeps(client *http.Client, dayURLByCar map[string]string, slotHou
 		},
 		reauth: func() bool { return restoreSession(client) },
 		sleep:  time.Sleep,
+		jitter: jitterDelay,
 		now:    time.Now,
 		notify: toast,
 	}
