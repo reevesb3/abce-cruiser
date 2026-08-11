@@ -24,6 +24,14 @@ func carDayURL(c car, target time.Time) string {
 	return fmt.Sprintf("%s/%s?view=day&day=%d&month=%d", scheduleBase, c.Name, target.Day(), int(target.Month()))
 }
 
+// carAgendaURL is the logged-in user's own reservations for one car. Unlike the
+// day view it lists nothing but your bookings — no other students, no
+// open-hours table — which makes it the authoritative answer to "what do I
+// hold", independent of how the day view chunks its booking payload.
+func carAgendaURL(c car) string {
+	return fmt.Sprintf("%s/%s?view=agenda", scheduleBase, c.Name)
+}
+
 // roleLabel resolves a resource id to its seat label across all cars.
 func roleLabel(resourceID string) string {
 	for _, c := range cars {
@@ -128,6 +136,10 @@ type carPage struct {
 // loadCarPages retrieves the day view for every car (or a single local file for
 // offline testing). Cookies are loaded once up front; the first live fetch
 // handles any reauth, and the refreshed session carries to the rest.
+// cookieLoadLogged keeps the "loaded cached session cookie" line to once per
+// run — -mine loads car pages twice (one fetch per anchor day).
+var cookieLoadLogged bool
+
 func loadCarPages(cfg config, client *http.Client, target time.Time) ([]carPage, error) {
 	if cfg.fromFile != "" {
 		logf("Reading day view from file: %s", cfg.fromFile)
@@ -137,18 +149,30 @@ func loadCarPages(cfg config, client *http.Client, target time.Time) ([]carPage,
 		}
 		return []carPage{{detectCar(page), page}}, nil
 	}
-	if loadCookiesIntoJar(client) {
-		logf("Loaded cached session cookie (OS credential store).")
-	}
+	ensureSession(client)
 	pages := make([]carPage, 0, len(cars))
 	for _, c := range cars {
-		page, err := loadPage(liveSource(client, carDayURL(c, target)), liveLoadDeps(cfg, client))
+		page, err := loadLivePage(cfg, client, carDayURL(c, target))
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", c.Name, err)
 		}
 		pages = append(pages, carPage{c, page})
 	}
 	return pages, nil
+}
+
+// ensureSession loads the cached session cookie into the jar, logging it at
+// most once per run (a single command may load several pages).
+func ensureSession(client *http.Client) {
+	if loadCookiesIntoJar(client) && !cookieLoadLogged {
+		cookieLoadLogged = true
+		logf("Loaded cached session cookie (OS credential store).")
+	}
+}
+
+// loadLivePage fetches one schedule URL through the retry/reauth pipeline.
+func loadLivePage(cfg config, client *http.Client, url string) (string, error) {
+	return loadPage(liveSource(client, url), liveLoadDeps(cfg, client))
 }
 
 // detectCar identifies which car a page belongs to by the resource ids present
@@ -341,6 +365,11 @@ type mySlot struct {
 	Car        string
 	MyRole     string // seat label of the user's booking
 	Partner    string // name in the opposite seat, or "" if it's still open
+	// SeatChecked records whether we actually saw the day this booking sits on.
+	// The agenda view lists your lessons but nobody else's, so the opposite seat
+	// is only knowable from a day view that covers the date. False means "not
+	// looked at" — which must not be reported as "still open".
+	SeatChecked bool
 }
 
 // seatPhrase turns a seat label into plain English.
@@ -354,38 +383,73 @@ func seatPhrase(label string) string {
 	return label
 }
 
+// bookingKey identifies one seat-on-one-start within a car's page.
+func bookingKey(resource string, start time.Time) string {
+	return resource + "@" + start.Format(time.RFC3339)
+}
+
+// ownedUpcoming returns the user's own bookings on a page, from `from` onward.
+func ownedUpcoming(page string, ownerName string, from time.Time) []booking {
+	var out []booking
+	for _, b := range getAllBookings(page, ownerName) {
+		if b.Owned && !b.Start.Before(from) {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// partnerFor answers "who holds the other seat of this lesson" from a day view.
+//
+// covered reports whether the page actually spans the booking's date, detected
+// by the booking itself being present: the day view returns a chunk of dates
+// that is not always the one requested, so a page that doesn't list your own
+// booking cannot be trusted to tell you the opposite seat is empty either.
+func partnerFor(page string, c car, b booking, ownerName string) (partner string, covered bool) {
+	byKey := make(map[string]booking)
+	for _, x := range getAllBookings(page, ownerName) {
+		byKey[bookingKey(x.Resource, x.Start)] = x
+	}
+	if _, ok := byKey[bookingKey(b.Resource, b.Start)]; !ok {
+		return "", false
+	}
+	if p, ok := byKey[bookingKey(oppositeResource(c, b.Resource), b.Start)]; ok {
+		return p.Name, true
+	}
+	return "", true
+}
+
+func sortMySlots(s []mySlot) {
+	sort.Slice(s, func(i, j int) bool {
+		if !s[i].Start.Equal(s[j].Start) {
+			return s[i].Start.Before(s[j].Start)
+		}
+		return s[i].Car < s[j].Car
+	})
+}
+
 // collectMySlots finds the user's own bookings across all cars (from `from`
-// onward) and pairs each with the person in the opposite seat.
+// onward) and pairs each with the person in the opposite seat, using day-view
+// pages that carry everyone's bookings. Used by the -from-file path; the live
+// -mine path drives the agenda view instead (see runMine).
 func collectMySlots(pages []carPage, ownerName string, from time.Time) []mySlot {
 	var out []mySlot
+	seen := make(map[string]bool)
 	for _, cp := range pages {
-		all := getAllBookings(cp.page, ownerName)
-		// index by resource + start so we can find the opposite seat's booking
-		byKey := make(map[string]booking, len(all))
-		for _, b := range all {
-			byKey[b.Resource+"@"+b.Start.Format(time.RFC3339)] = b
-		}
-		for _, b := range all {
-			if !b.Owned || b.Start.Before(from) {
+		for _, b := range ownedUpcoming(cp.page, ownerName, from) {
+			key := cp.car.Name + "|" + bookingKey(b.Resource, b.Start)
+			if seen[key] {
 				continue
 			}
-			oppID := oppositeResource(cp.car, b.Resource)
-			partner := ""
-			if p, ok := byKey[oppID+"@"+b.Start.Format(time.RFC3339)]; ok {
-				partner = p.Name
-			}
+			seen[key] = true
+			partner, _ := partnerFor(cp.page, cp.car, b, ownerName)
 			out = append(out, mySlot{
 				Start: b.Start, End: b.End, Car: cp.car.Name,
-				MyRole: roleLabel(b.Resource), Partner: partner,
+				MyRole: roleLabel(b.Resource), Partner: partner, SeatChecked: true,
 			})
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].Start.Equal(out[j].Start) {
-			return out[i].Start.Before(out[j].Start)
-		}
-		return out[i].Car < out[j].Car
-	})
+	sortMySlots(out)
 	return out
 }
 
@@ -397,7 +461,10 @@ func renderMySlots(slots []mySlot) string {
 	b.WriteString("\nYour booked lessons:\n\n")
 	for _, s := range slots {
 		partner := "with " + s.Partner
-		if s.Partner == "" {
+		switch {
+		case !s.SeatChecked:
+			partner = "opposite seat unknown (day view didn't cover it)"
+		case s.Partner == "":
 			partner = "opposite seat still open"
 		}
 		fmt.Fprintf(&b, "  %s   %s-%s   %s\n", s.Start.Format("Mon Jan 2"), s.Start.Format("3:04PM"), s.End.Format("3:04PM"), s.Car)
@@ -724,21 +791,79 @@ func defaultWeekStart(now time.Time) time.Time {
 }
 
 // runMine shows the user's own booked lessons and who holds the opposite seat.
-// One fetch per car — the day view carries every booking in the loaded window.
+//
+// The lesson list comes from each car's agenda view, which returns exactly the
+// user's own reservations. The day view can't be trusted for this: it answers
+// with a chunk of booking data that is not centred on the day requested, so
+// asking it for a given date may return an unrelated span and appear to show no
+// bookings at all. Agenda has no opposite-seat information (it lists nobody
+// else), so each lesson's partner is filled in from a day view afterwards —
+// one fetch per date, reused across every lesson that page turns out to cover.
 func runMine(cfg config, client *http.Client) error {
 	n := time.Now()
 	today := time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, time.UTC)
-	// The day view returns bookings for roughly [reqDay-28, reqDay+1], so we
-	// point the fetch ~28 days out — its window then spans the whole bookable
-	// range [today, today+28] while we still display only from today onward.
-	fetchDay := today.AddDate(0, 0, 28)
-	pages, err := loadCarPages(cfg, client, fetchDay)
-	if err != nil {
-		return err
+
+	// The -from-file path has a single day-view page and no server to ask.
+	if cfg.fromFile != "" {
+		pages, err := loadCarPages(cfg, client, today)
+		if err != nil {
+			return err
+		}
+		prof, _ := resolveProfile(pages[0].page, loadProfile)
+		fmt.Print(renderMySlots(collectMySlots(pages, prof.FullName, today)))
+		return nil
 	}
-	prof, _ := resolveProfile(pages[0].page, loadProfile)
-	fmt.Print(renderMySlots(collectMySlots(pages, prof.FullName, today)))
+
+	ensureSession(client)
+	var prof profileInfo
+	var slots []mySlot
+	for _, c := range cars {
+		agenda, err := loadLivePage(cfg, client, carAgendaURL(c))
+		if err != nil {
+			return fmt.Errorf("%s agenda: %w", c.Name, err)
+		}
+		if prof.FullName == "" {
+			prof, _ = resolveProfile(agenda, loadProfile)
+		}
+		slots = append(slots, seatDetails(cfg, client, c, ownedUpcoming(agenda, prof.FullName, today), prof.FullName)...)
+	}
+	sortMySlots(slots)
+	fmt.Print(renderMySlots(slots))
 	return nil
+}
+
+// seatDetails turns one car's own-bookings into display rows, fetching day
+// views to discover who holds the opposite seat. Each fetch resolves every
+// remaining booking its page happens to cover, so a run of lessons inside one
+// chunk costs a single request. A booking its own day view fails to cover is
+// still reported, with the seat marked unknown rather than guessed as open.
+func seatDetails(cfg config, client *http.Client, c car, pending []booking, ownerName string) []mySlot {
+	var out []mySlot
+	for len(pending) > 0 {
+		head := pending[0]
+		day := time.Date(head.Start.Year(), head.Start.Month(), head.Start.Day(), 0, 0, 0, 0, time.UTC)
+		page, err := loadLivePage(cfg, client, carDayURL(c, day))
+		if err != nil {
+			logf("Note: could not load %s %s to check the opposite seat: %v",
+				c.Name, day.Format("Jan 2"), err)
+			page = "" // covers nothing; every pending booking falls through as unknown
+		}
+		var next []booking
+		for _, b := range pending {
+			partner, covered := partnerFor(page, c, b, ownerName)
+			isHead := b.Resource == head.Resource && b.Start.Equal(head.Start)
+			if !covered && !isHead {
+				next = append(next, b) // another date's fetch may cover it
+				continue
+			}
+			out = append(out, mySlot{
+				Start: b.Start, End: b.End, Car: c.Name,
+				MyRole: roleLabel(b.Resource), Partner: partner, SeatChecked: covered,
+			})
+		}
+		pending = next // head always leaves the queue, so this terminates
+	}
+	return out
 }
 
 // runWeek shows a week of availability across all cars — read-only, one fetch
