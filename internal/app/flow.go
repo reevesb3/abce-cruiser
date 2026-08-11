@@ -128,6 +128,10 @@ type carPage struct {
 // loadCarPages retrieves the day view for every car (or a single local file for
 // offline testing). Cookies are loaded once up front; the first live fetch
 // handles any reauth, and the refreshed session carries to the rest.
+// cookieLoadLogged keeps the "loaded cached session cookie" line to once per
+// run — -mine loads car pages twice (one fetch per anchor day).
+var cookieLoadLogged bool
+
 func loadCarPages(cfg config, client *http.Client, target time.Time) ([]carPage, error) {
 	if cfg.fromFile != "" {
 		logf("Reading day view from file: %s", cfg.fromFile)
@@ -137,7 +141,8 @@ func loadCarPages(cfg config, client *http.Client, target time.Time) ([]carPage,
 		}
 		return []carPage{{detectCar(page), page}}, nil
 	}
-	if loadCookiesIntoJar(client) {
+	if loadCookiesIntoJar(client) && !cookieLoadLogged {
+		cookieLoadLogged = true
 		logf("Loaded cached session cookie (OS credential store).")
 	}
 	pages := make([]carPage, 0, len(cars))
@@ -356,8 +361,12 @@ func seatPhrase(label string) string {
 
 // collectMySlots finds the user's own bookings across all cars (from `from`
 // onward) and pairs each with the person in the opposite seat.
+// collectMySlots gathers the user's own bookings across every page. Callers may
+// pass the same car more than once (one page per fetch anchor), so identical
+// bookings are deduped by car + seat + start.
 func collectMySlots(pages []carPage, ownerName string, from time.Time) []mySlot {
 	var out []mySlot
+	seen := make(map[string]bool)
 	for _, cp := range pages {
 		all := getAllBookings(cp.page, ownerName)
 		// index by resource + start so we can find the opposite seat's booking
@@ -369,6 +378,11 @@ func collectMySlots(pages []carPage, ownerName string, from time.Time) []mySlot 
 			if !b.Owned || b.Start.Before(from) {
 				continue
 			}
+			key := cp.car.Name + "|" + b.Resource + "|" + b.Start.Format(time.RFC3339)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 			oppID := oppositeResource(cp.car, b.Resource)
 			partner := ""
 			if p, ok := byKey[oppID+"@"+b.Start.Format(time.RFC3339)]; ok {
@@ -728,15 +742,30 @@ func defaultWeekStart(now time.Time) time.Time {
 func runMine(cfg config, client *http.Client) error {
 	n := time.Now()
 	today := time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, time.UTC)
-	// The day view returns bookings for roughly [reqDay-28, reqDay+1], so we
-	// point the fetch ~28 days out — its window then spans the whole bookable
-	// range [today, today+28] while we still display only from today onward.
-	fetchDay := today.AddDate(0, 0, 28)
-	pages, err := loadCarPages(cfg, client, fetchDay)
-	if err != nil {
-		return err
+
+	// The day view does NOT return a window centred on the requested day: asking
+	// for today+28 (the booking frontier) comes back with an almost-empty tail
+	// chunk, which is why pointing the fetch there found nothing. Requesting
+	// today returns the full loaded chunk (weeks either side). Fetch both
+	// anchors and merge, so near-term lessons and anything sitting out at the
+	// frontier both show up regardless of which chunk the server hands back.
+	anchors := []time.Time{today, today.AddDate(0, 0, 28)}
+	if cfg.fromFile != "" {
+		anchors = anchors[:1] // the file path ignores the day anyway
 	}
-	prof, _ := resolveProfile(pages[0].page, loadProfile)
+
+	var pages []carPage
+	var prof profileInfo
+	for i, day := range anchors {
+		p, err := loadCarPages(cfg, client, day)
+		if err != nil {
+			return err
+		}
+		if i == 0 {
+			prof, _ = resolveProfile(p[0].page, loadProfile)
+		}
+		pages = append(pages, p...)
+	}
 	fmt.Print(renderMySlots(collectMySlots(pages, prof.FullName, today)))
 	return nil
 }

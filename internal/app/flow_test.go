@@ -200,6 +200,20 @@ func TestCollectMySlots(t *testing.T) {
 	}
 }
 
+// -mine fetches each car twice (one page per anchor day) because the day view
+// returns a different chunk of booking data depending on the day requested.
+// The same booking arriving on both pages must be reported once.
+func TestCollectMySlotsDedupesRepeatedCars(t *testing.T) {
+	pages := []carPage{{cars[0], mineFixture()}, {cars[0], mineFixture()}}
+	slots := collectMySlots(pages, "Me", day("2026-08-15"))
+	if len(slots) != 2 {
+		t.Fatalf("slots = %d, want 2 (same car page twice must dedupe)", len(slots))
+	}
+	if slots[0].Partner != "Isla Flynn" {
+		t.Errorf("dedupe lost the partner lookup: %+v", slots[0])
+	}
+}
+
 func TestRenderMySlots(t *testing.T) {
 	slots := collectMySlots([]carPage{{cars[0], mineFixture()}}, "Me", day("2026-08-15"))
 	out := renderMySlots(slots)
