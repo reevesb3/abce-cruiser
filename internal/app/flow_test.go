@@ -200,9 +200,7 @@ func TestCollectMySlots(t *testing.T) {
 	}
 }
 
-// -mine fetches each car twice (one page per anchor day) because the day view
-// returns a different chunk of booking data depending on the day requested.
-// The same booking arriving on both pages must be reported once.
+// A page may be handed to collectMySlots more than once; report each booking once.
 func TestCollectMySlotsDedupesRepeatedCars(t *testing.T) {
 	pages := []carPage{{cars[0], mineFixture()}, {cars[0], mineFixture()}}
 	slots := collectMySlots(pages, "Me", day("2026-08-15"))
@@ -211,6 +209,54 @@ func TestCollectMySlotsDedupesRepeatedCars(t *testing.T) {
 	}
 	if slots[0].Partner != "Isla Flynn" {
 		t.Errorf("dedupe lost the partner lookup: %+v", slots[0])
+	}
+}
+
+func TestOwnedUpcoming(t *testing.T) {
+	got := ownedUpcoming(mineFixture(), "Me", day("2026-08-15"))
+	if len(got) != 2 {
+		t.Fatalf("ownedUpcoming = %d bookings, want 2 (past + other people's excluded)", len(got))
+	}
+	for _, b := range got {
+		if !b.Owned {
+			t.Errorf("returned a booking that isn't the user's: %+v", b)
+		}
+	}
+}
+
+// partnerFor must distinguish "the other seat is empty" from "this page never
+// covered the date" — the day view returns a chunk that may not include the
+// requested day, and an uncovered date must not be reported as a free seat.
+func TestPartnerForCoverage(t *testing.T) {
+	mine := ownedUpcoming(mineFixture(), "Me", day("2026-08-15"))
+	aug18, aug20 := mine[0], mine[1]
+
+	if p, covered := partnerFor(mineFixture(), cars[0], aug18, "Me"); !covered || p != "Isla Flynn" {
+		t.Errorf("Aug 18: partner=%q covered=%v, want Isla Flynn/true", p, covered)
+	}
+	if p, covered := partnerFor(mineFixture(), cars[0], aug20, "Me"); !covered || p != "" {
+		t.Errorf("Aug 20: partner=%q covered=%v, want empty/true (seat genuinely open)", p, covered)
+	}
+	// a page from an unrelated chunk: booking absent => not covered, not "open"
+	if p, covered := partnerFor(fixture(), cars[0], aug18, "Me"); covered || p != "" {
+		t.Errorf("uncovered page: partner=%q covered=%v, want empty/false", p, covered)
+	}
+	if _, covered := partnerFor("", cars[0], aug18, "Me"); covered {
+		t.Error("empty page reported as covering the booking")
+	}
+}
+
+// An unchecked seat must read as unknown, never as "still open".
+func TestRenderMySlotsUncheckedSeat(t *testing.T) {
+	out := renderMySlots([]mySlot{{
+		Start: day("2026-08-18"), End: day("2026-08-18").Add(2 * time.Hour),
+		Car: "Car1", MyRole: "Drive-Observation", SeatChecked: false,
+	}})
+	if !strings.Contains(out, "opposite seat unknown") {
+		t.Errorf("unchecked seat not flagged:\n%s", out)
+	}
+	if strings.Contains(out, "still open") {
+		t.Errorf("unchecked seat wrongly reported as open:\n%s", out)
 	}
 }
 
